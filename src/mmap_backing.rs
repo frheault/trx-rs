@@ -14,6 +14,7 @@ pub fn vec_to_bytes<T: Pod>(v: Vec<T>) -> Vec<u8> {
 /// (used for converted offsets, deep copies, etc.).
 pub enum MmapBacking {
     ReadOnly(Mmap),
+    ReadOnlySliced { mmap: Mmap, offset: usize, len: usize },
     ReadWrite(MmapMut),
     Owned(Vec<u8>),
 }
@@ -23,6 +24,7 @@ impl MmapBacking {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             MmapBacking::ReadOnly(m) => m,
+            MmapBacking::ReadOnlySliced { mmap, offset, len } => &mmap[*offset..*offset + *len],
             MmapBacking::ReadWrite(m) => m,
             MmapBacking::Owned(v) => v,
         }
@@ -31,7 +33,7 @@ impl MmapBacking {
     /// Mutable raw bytes view (only for ReadWrite and Owned).
     pub fn as_bytes_mut(&mut self) -> Result<&mut [u8]> {
         match self {
-            MmapBacking::ReadOnly(_) => Err(TrxError::Argument(
+            MmapBacking::ReadOnly(_) | MmapBacking::ReadOnlySliced { .. } => Err(TrxError::Argument(
                 "cannot mutably access read-only mmap".into(),
             )),
             MmapBacking::ReadWrite(m) => Ok(m.as_mut()),
@@ -50,7 +52,7 @@ impl MmapBacking {
     }
 
     pub fn is_mapped(&self) -> bool {
-        matches!(self, MmapBacking::ReadOnly(_) | MmapBacking::ReadWrite(_))
+        matches!(self, MmapBacking::ReadOnly(_) | MmapBacking::ReadOnlySliced { .. } | MmapBacking::ReadWrite(_))
     }
 
     /// Cast the raw bytes to a typed slice.
@@ -72,6 +74,7 @@ impl std::fmt::Debug for MmapBacking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MmapBacking::ReadOnly(m) => write!(f, "ReadOnly({} bytes)", m.len()),
+            MmapBacking::ReadOnlySliced { len, .. } => write!(f, "ReadOnlySliced({} bytes)", len),
             MmapBacking::ReadWrite(m) => write!(f, "ReadWrite({} bytes)", m.len()),
             MmapBacking::Owned(v) => write!(f, "Owned({} bytes)", v.len()),
         }

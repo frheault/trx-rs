@@ -44,15 +44,23 @@ impl OffsetsDtype {
         }
     }
 
-    /// Serialise an in-memory `u32` offset slice to disk bytes at this width.
-    pub(crate) fn encode(self, offsets: &[u32]) -> Vec<u8> {
+    /// Write an in-memory `u32` offset slice directly to a stream at this width.
+    pub(crate) fn write_to_stream<W: std::io::Write>(self, offsets: &[u32], writer: &mut W) -> crate::error::Result<()> {
         match self {
-            OffsetsDtype::U32 => crate::mmap_backing::vec_to_bytes(offsets.to_vec()),
+            OffsetsDtype::U32 => {
+                writer.write_all(bytemuck::cast_slice(offsets))?;
+            }
             OffsetsDtype::U64 => {
-                let widened: Vec<u64> = offsets.iter().map(|&o| o as u64).collect();
-                crate::mmap_backing::vec_to_bytes(widened)
+                let chunk_size = 8192;
+                let mut buf = Vec::with_capacity(chunk_size);
+                for chunk in offsets.chunks(chunk_size) {
+                    buf.clear();
+                    buf.extend(chunk.iter().map(|&o| o as u64));
+                    writer.write_all(bytemuck::cast_slice(&buf))?;
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -65,33 +73,8 @@ struct TrxArchiveIndex {
 }
 
 /// Load a TRX file from a `.trx` zip archive.
-///
-/// Extracts the archive to a temporary directory, then delegates to the
-/// directory loader. The `TempDir` handle is stored in the returned `TrxFile`
-/// so the temp files remain alive while mmaps reference them.
 pub fn load_from_zip<P: TrxScalar>(path: &Path) -> Result<TrxFile<P>> {
-    let file = fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-
-    let tempdir = tempfile::TempDir::new()?;
-    let temp_path = tempdir.path().to_path_buf();
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let entry_path = temp_path.join(entry.name());
-
-        if entry.is_dir() {
-            fs::create_dir_all(&entry_path)?;
-        } else {
-            if let Some(parent) = entry_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out_file = fs::File::create(&entry_path)?;
-            std::io::copy(&mut entry, &mut out_file)?;
-        }
-    }
-
-    crate::io::directory::load_from_directory(&temp_path, Some(tempdir))
+    crate::io::directory::load_from_zip_impl(path)
 }
 
 /// Save a `TrxFile<P>` to a `.trx` zip archive.
@@ -136,8 +119,7 @@ pub fn save_to_zip_with<P: TrxScalar>(
     // Offsets — written at `offsets_dtype`'s width.
     let offsets_filename = format!("offsets.{}", offsets_dtype.suffix());
     zip.start_file(&offsets_filename, stored)?;
-    let offsets_bytes = offsets_dtype.encode(trx.offsets());
-    zip.write_all(&offsets_bytes)?;
+    offsets_dtype.write_to_stream(trx.offsets(), &mut zip)?;
 
     // DPS / DPV — float-heavy, Stored.
     write_data_map(&mut zip, "dps", trx.dps_arrays(), stored)?;

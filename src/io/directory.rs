@@ -235,8 +235,8 @@ pub fn save_to_directory<P: TrxScalar>(trx: &TrxFile<P>, dir: &Path) -> Result<(
 
     // Offsets — written at `offsets_dtype`'s width.
     let offsets_filename = format!("offsets.{}", offsets_dtype.suffix());
-    let offsets_bytes = offsets_dtype.encode(trx.offsets());
-    fs::write(dir.join(offsets_filename), offsets_bytes)?;
+    let mut file = fs::File::create(dir.join(offsets_filename))?;
+    offsets_dtype.write_to_stream(trx.offsets(), &mut file)?;
 
     // DPS
     save_data_dir(trx.dps_arrays(), &dir.join("dps"))?;
@@ -489,4 +489,193 @@ fn filename_for_array(name: &str, arr: &DataArray) -> String {
         dtype: arr.dtype(),
     }
     .to_filename()
+}
+
+pub(crate) fn load_from_zip_impl<P: TrxScalar>(path: &Path) -> Result<TrxFile<P>> {
+    let file = fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    
+    // Header
+    let mut header_file = archive.by_name("header.json")?;
+    let mut header_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut header_file, &mut header_bytes)?;
+    let header: Header = serde_json::from_slice(&header_bytes)?;
+    drop(header_file);
+    
+    // Positions
+    let pos_name = (0..archive.len())
+        .find_map(|i| {
+            let name = archive.name_for_index(i).unwrap().to_string();
+            if name.starts_with("positions.") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| TrxError::Format("no positions file found in zip archive".into()))?;
+        
+    let pos_parsed = TrxFilename::parse(&pos_name)?;
+    if pos_parsed.dtype != P::DTYPE {
+        return Err(TrxError::DType(format!(
+            "expected positions dtype {}, got {}",
+            P::DTYPE,
+            pos_parsed.dtype
+        )));
+    }
+    if pos_parsed.ncols != 3 {
+        return Err(TrxError::Format(format!(
+            "positions must have 3 columns, got {}",
+            pos_parsed.ncols
+        )));
+    }
+    
+    let pos_file = archive.by_name(&pos_name)?;
+    let pos_data_start = pos_file.data_start();
+    let pos_size = pos_file.size();
+    let pos_compression = pos_file.compression();
+    drop(pos_file);
+    
+    let file = fs::File::open(path)?;
+    
+    let is_aligned = |offset: u64, size: usize| -> bool {
+        offset % (size as u64) == 0
+    };
+    
+    let page_size = 4096;
+    
+    let positions_backing = if pos_compression == zip::CompressionMethod::Stored && is_aligned(pos_data_start, std::mem::size_of::<P>()) {
+        let align_offset = pos_data_start % page_size;
+        let map_offset = pos_data_start - align_offset;
+        let map_len = pos_size as usize + align_offset as usize;
+        let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
+        MmapBacking::ReadOnlySliced { mmap, offset: align_offset as usize, len: pos_size as usize }
+    } else {
+        let mut pos_file = archive.by_name(&pos_name)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut pos_file, &mut bytes)?;
+        MmapBacking::Owned(bytes)
+    };
+    
+    // Offsets
+    let off_name = (0..archive.len())
+        .find_map(|i| {
+            let name = archive.name_for_index(i).unwrap().to_string();
+            if name.starts_with("offsets.") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| TrxError::Format("no offsets file found in zip archive".into()))?;
+        
+    let off_parsed = TrxFilename::parse(&off_name)?;
+    
+    let off_file = archive.by_name(&off_name)?;
+    let off_data_start = off_file.data_start();
+    let off_size = off_file.size();
+    let off_compression = off_file.compression();
+    drop(off_file);
+    
+    let offsets_backing = if off_compression == zip::CompressionMethod::Stored && is_aligned(off_data_start, off_parsed.dtype.size_of()) {
+        let align_offset = off_data_start % page_size;
+        let map_offset = off_data_start - align_offset;
+        let map_len = off_size as usize + align_offset as usize;
+        let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
+        
+        let slice_len = off_size as usize;
+        let slice_offset = align_offset as usize;
+        let backed = MmapBacking::ReadOnlySliced { mmap, offset: slice_offset, len: slice_len };
+        let mut owned_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Cursor::new(backed.as_bytes()), &mut owned_bytes)?;
+        let mut owned_mmap = memmap2::MmapMut::map_anon(owned_bytes.len())?;
+        owned_mmap.copy_from_slice(&owned_bytes);
+        
+        convert_offsets_to_u32(
+            &owned_mmap.make_read_only()?,
+            off_parsed.dtype,
+            header.nb_streamlines as usize,
+            header.nb_vertices as usize,
+        )?
+    } else {
+        let mut off_file = archive.by_name(&off_name)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut off_file, &mut bytes)?;
+        let mut mmap = memmap2::MmapMut::map_anon(bytes.len())?;
+        mmap.copy_from_slice(&bytes);
+        convert_offsets_to_u32(
+            &mmap.make_read_only()?,
+            off_parsed.dtype,
+            header.nb_streamlines as usize,
+            header.nb_vertices as usize,
+        )?
+    };
+    
+    // DPS, DPV, groups, dpg
+    let mut dps = HashMap::new();
+    let mut dpv = HashMap::new();
+    let mut groups = HashMap::new();
+    let mut dpg = HashMap::new();
+    
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        let name = entry.name().to_string();
+        if name.ends_with('/') || name == "header.json" || name.starts_with("positions.") || name.starts_with("offsets.") {
+            continue;
+        }
+        
+        let data_start = entry.data_start();
+        let size = entry.size();
+        let compression = entry.compression();
+        let is_stored = compression == zip::CompressionMethod::Stored;
+        drop(entry); // Need to drop borrow to access archive
+        
+        let file = fs::File::open(path)?;
+        let load_entry = |archive: &mut zip::ZipArchive<fs::File>, dtype_size: usize| -> Result<MmapBacking> {
+            if is_stored && is_aligned(data_start, dtype_size) {
+                let align_offset = data_start % page_size;
+                let map_offset = data_start - align_offset;
+                let map_len = size as usize + align_offset as usize;
+                let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
+                Ok(MmapBacking::ReadOnlySliced { mmap, offset: align_offset as usize, len: size as usize })
+            } else {
+                let mut entry = archive.by_name(&name)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut bytes)?;
+                Ok(MmapBacking::Owned(bytes))
+            }
+        };
+        
+        if name.starts_with("dps/") {
+            let basename = name.strip_prefix("dps/").unwrap();
+            let parsed = TrxFilename::parse(basename)?;
+            dps.insert(parsed.name, DataArray::from_backing(load_entry(&mut archive, parsed.dtype.size_of())?, parsed.ncols, parsed.dtype));
+        } else if name.starts_with("dpv/") {
+            let basename = name.strip_prefix("dpv/").unwrap();
+            let parsed = TrxFilename::parse(basename)?;
+            dpv.insert(parsed.name, DataArray::from_backing(load_entry(&mut archive, parsed.dtype.size_of())?, parsed.ncols, parsed.dtype));
+        } else if name.starts_with("groups/") {
+            let basename = name.strip_prefix("groups/").unwrap();
+            let parsed = TrxFilename::parse(basename)?;
+            groups.insert(parsed.name, DataArray::from_backing(load_entry(&mut archive, parsed.dtype.size_of())?, parsed.ncols, parsed.dtype));
+        } else if name.starts_with("dpg/") {
+            let rest = name.strip_prefix("dpg/").unwrap();
+            if let Some((group, basename)) = rest.split_once('/') {
+                let parsed = TrxFilename::parse(basename)?;
+                dpg.entry(group.to_string())
+                    .or_insert_with(HashMap::new)
+                    .insert(parsed.name, DataArray::from_backing(load_entry(&mut archive, parsed.dtype.size_of())?, parsed.ncols, parsed.dtype));
+            }
+        }
+    }
+    
+    Ok(TrxFile::from_parts(TrxParts {
+        header,
+        positions_backing,
+        offsets_backing,
+        dps,
+        dpv,
+        groups,
+        dpg,
+        tempdir: None,
+    }))
 }
