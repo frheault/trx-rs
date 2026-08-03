@@ -102,44 +102,64 @@ pub fn load_from_directory<P: TrxScalar>(
     let header = Header::from_file(&dir.join("header.json"))?;
 
     // Positions
-    let pos_path = find_file_with_prefix(dir, "positions")?;
-    let pos_fname = pos_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| TrxError::Format("invalid positions filename".into()))?;
-    let pos_parsed = TrxFilename::parse(pos_fname)?;
-
-    if pos_parsed.dtype != P::DTYPE {
-        return Err(TrxError::DType(format!(
-            "expected positions dtype {}, got {}",
-            P::DTYPE,
-            pos_parsed.dtype
-        )));
-    }
-    if pos_parsed.ncols != 3 {
-        return Err(TrxError::Format(format!(
-            "positions must have 3 columns, got {}",
-            pos_parsed.ncols
-        )));
-    }
-
-    let positions_backing = MmapBacking::ReadOnly(mmap_file(&pos_path)?);
+    let positions_backing = match find_file_with_prefix(dir, "positions") {
+        Ok(pos_path) => {
+            let pos_fname = pos_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| TrxError::Format("invalid positions filename".into()))?;
+            let pos_parsed = TrxFilename::parse(pos_fname)?;
+        
+            if pos_parsed.dtype != P::DTYPE {
+                return Err(TrxError::DType(format!(
+                    "expected positions dtype {}, got {}",
+                    P::DTYPE,
+                    pos_parsed.dtype
+                )));
+            }
+            if pos_parsed.ncols != 3 {
+                return Err(TrxError::Format(format!(
+                    "positions must have 3 columns, got {}",
+                    pos_parsed.ncols
+                )));
+            }
+        
+            MmapBacking::ReadOnly(mmap_file(&pos_path)?)
+        },
+        Err(e) => {
+            if header.nb_vertices == 0 {
+                MmapBacking::Owned(Vec::new())
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // Offsets
-    let off_path = find_file_with_prefix(dir, "offsets")?;
-    let off_fname = off_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| TrxError::Format("invalid offsets filename".into()))?;
-    let off_parsed = TrxFilename::parse(off_fname)?;
-
-    let offsets_mmap = mmap_file(&off_path)?;
-    let offsets_backing = convert_offsets_to_u32(
-        &offsets_mmap,
-        off_parsed.dtype,
-        header.nb_streamlines as usize,
-        header.nb_vertices as usize,
-    )?;
+    let offsets_backing = match find_file_with_prefix(dir, "offsets") {
+        Ok(off_path) => {
+            let off_fname = off_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| TrxError::Format("invalid offsets filename".into()))?;
+            let off_parsed = TrxFilename::parse(off_fname)?;
+        
+            let offsets_mmap = mmap_file(&off_path)?;
+            convert_offsets_to_u32(
+                &offsets_mmap,
+                off_parsed.dtype,
+                header.nb_streamlines as usize,
+                header.nb_vertices as usize,
+            )?
+        },
+        Err(e) => {
+            if header.nb_streamlines == 0 {
+                MmapBacking::Owned(crate::mmap_backing::vec_to_bytes(vec![0u32]))
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // DPS, DPV, groups
     let dps = load_data_dir(&dir.join("dps"))?;
@@ -503,7 +523,7 @@ pub(crate) fn load_from_zip_impl<P: TrxScalar>(path: &Path) -> Result<TrxFile<P>
     drop(header_file);
     
     // Positions
-    let pos_name = (0..archive.len())
+    let pos_name_opt = (0..archive.len())
         .find_map(|i| {
             let name = archive.name_for_index(i).unwrap().to_string();
             if name.starts_with("positions.") {
@@ -511,53 +531,60 @@ pub(crate) fn load_from_zip_impl<P: TrxScalar>(path: &Path) -> Result<TrxFile<P>
             } else {
                 None
             }
-        })
-        .ok_or_else(|| TrxError::Format("no positions file found in zip archive".into()))?;
-        
-    let pos_parsed = TrxFilename::parse(&pos_name)?;
-    if pos_parsed.dtype != P::DTYPE {
-        return Err(TrxError::DType(format!(
-            "expected positions dtype {}, got {}",
-            P::DTYPE,
-            pos_parsed.dtype
-        )));
-    }
-    if pos_parsed.ncols != 3 {
-        return Err(TrxError::Format(format!(
-            "positions must have 3 columns, got {}",
-            pos_parsed.ncols
-        )));
-    }
-    
-    let pos_file = archive.by_name(&pos_name)?;
-    let pos_data_start = pos_file.data_start();
-    let pos_size = pos_file.size();
-    let pos_compression = pos_file.compression();
-    drop(pos_file);
-    
-    let file = fs::File::open(path)?;
-    
+        });
     let is_aligned = |offset: u64, size: usize| -> bool {
         offset % (size as u64) == 0
     };
-    
     let page_size = 4096;
-    
-    let positions_backing = if pos_compression == zip::CompressionMethod::Stored && is_aligned(pos_data_start, std::mem::size_of::<P>()) {
-        let align_offset = pos_data_start % page_size;
-        let map_offset = pos_data_start - align_offset;
-        let map_len = pos_size as usize + align_offset as usize;
-        let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
-        MmapBacking::ReadOnlySliced { mmap, offset: align_offset as usize, len: pos_size as usize }
-    } else {
-        let mut pos_file = archive.by_name(&pos_name)?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut pos_file, &mut bytes)?;
-        MmapBacking::Owned(bytes)
+    let file = fs::File::open(path)?;
+
+    let positions_backing = match pos_name_opt {
+        Some(pos_name) => {
+            let pos_parsed = TrxFilename::parse(&pos_name)?;
+            if pos_parsed.dtype != P::DTYPE {
+                return Err(TrxError::DType(format!(
+                    "expected positions dtype {}, got {}",
+                    P::DTYPE,
+                    pos_parsed.dtype
+                )));
+            }
+            if pos_parsed.ncols != 3 {
+                return Err(TrxError::Format(format!(
+                    "positions must have 3 columns, got {}",
+                    pos_parsed.ncols
+                )));
+            }
+            
+            let pos_file = archive.by_name(&pos_name)?;
+            let pos_data_start = pos_file.data_start();
+            let pos_size = pos_file.size();
+            let pos_compression = pos_file.compression();
+            drop(pos_file);
+            
+            if pos_compression == zip::CompressionMethod::Stored && is_aligned(pos_data_start, std::mem::size_of::<P>()) {
+                let align_offset = pos_data_start % page_size;
+                let map_offset = pos_data_start - align_offset;
+                let map_len = pos_size as usize + align_offset as usize;
+                let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
+                MmapBacking::ReadOnlySliced { mmap, offset: align_offset as usize, len: pos_size as usize }
+            } else {
+                let mut pos_file = archive.by_name(&pos_name)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut pos_file, &mut bytes)?;
+                MmapBacking::Owned(bytes)
+            }
+        }
+        None => {
+            if header.nb_vertices == 0 {
+                MmapBacking::Owned(Vec::new())
+            } else {
+                return Err(TrxError::Format("no positions file found in zip archive".into()));
+            }
+        }
     };
     
     // Offsets
-    let off_name = (0..archive.len())
+    let off_name_opt = (0..archive.len())
         .find_map(|i| {
             let name = archive.name_for_index(i).unwrap().to_string();
             if name.starts_with("offsets.") {
@@ -565,49 +592,53 @@ pub(crate) fn load_from_zip_impl<P: TrxScalar>(path: &Path) -> Result<TrxFile<P>
             } else {
                 None
             }
-        })
-        .ok_or_else(|| TrxError::Format("no offsets file found in zip archive".into()))?;
+        });
         
-    let off_parsed = TrxFilename::parse(&off_name)?;
-    
-    let off_file = archive.by_name(&off_name)?;
-    let off_data_start = off_file.data_start();
-    let off_size = off_file.size();
-    let off_compression = off_file.compression();
-    drop(off_file);
-    
-    let offsets_backing = if off_compression == zip::CompressionMethod::Stored && is_aligned(off_data_start, off_parsed.dtype.size_of()) {
-        let align_offset = off_data_start % page_size;
-        let map_offset = off_data_start - align_offset;
-        let map_len = off_size as usize + align_offset as usize;
-        let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
-        
-        let slice_len = off_size as usize;
-        let slice_offset = align_offset as usize;
-        let backed = MmapBacking::ReadOnlySliced { mmap, offset: slice_offset, len: slice_len };
-        let mut owned_bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Cursor::new(backed.as_bytes()), &mut owned_bytes)?;
-        let mut owned_mmap = memmap2::MmapMut::map_anon(owned_bytes.len())?;
-        owned_mmap.copy_from_slice(&owned_bytes);
-        
-        convert_offsets_to_u32(
-            &owned_mmap.make_read_only()?,
-            off_parsed.dtype,
-            header.nb_streamlines as usize,
-            header.nb_vertices as usize,
-        )?
-    } else {
-        let mut off_file = archive.by_name(&off_name)?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut off_file, &mut bytes)?;
-        let mut mmap = memmap2::MmapMut::map_anon(bytes.len())?;
-        mmap.copy_from_slice(&bytes);
-        convert_offsets_to_u32(
-            &mmap.make_read_only()?,
-            off_parsed.dtype,
-            header.nb_streamlines as usize,
-            header.nb_vertices as usize,
-        )?
+    let offsets_backing = match off_name_opt {
+        Some(off_name) => {
+            let off_parsed = TrxFilename::parse(&off_name)?;
+            
+            let off_file = archive.by_name(&off_name)?;
+            let off_data_start = off_file.data_start();
+            let off_size = off_file.size();
+            let off_compression = off_file.compression();
+            drop(off_file);
+            
+            let backed = if off_compression == zip::CompressionMethod::Stored && is_aligned(off_data_start, off_parsed.dtype.size_of()) {
+                let align_offset = off_data_start % page_size;
+                let map_offset = off_data_start - align_offset;
+                let map_len = off_size as usize + align_offset as usize;
+                let mmap = unsafe { memmap2::MmapOptions::new().offset(map_offset).len(map_len).map(&file)? };
+                
+                let slice_len = off_size as usize;
+                let slice_offset = align_offset as usize;
+                MmapBacking::ReadOnlySliced { mmap, offset: slice_offset, len: slice_len }
+            } else {
+                let mut off_file = archive.by_name(&off_name)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut off_file, &mut bytes)?;
+                MmapBacking::Owned(bytes)
+            };
+            
+            let mut owned_bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Cursor::new(backed.as_bytes()), &mut owned_bytes)?;
+            let mut owned_mmap = memmap2::MmapMut::map_anon(owned_bytes.len())?;
+            owned_mmap.copy_from_slice(&owned_bytes);
+            
+            convert_offsets_to_u32(
+                &owned_mmap.make_read_only()?,
+                off_parsed.dtype,
+                header.nb_streamlines as usize,
+                header.nb_vertices as usize,
+            )?
+        }
+        None => {
+            if header.nb_streamlines == 0 {
+                MmapBacking::Owned(crate::mmap_backing::vec_to_bytes(vec![0u32])) // [0] as u32
+            } else {
+                return Err(TrxError::Format("no offsets file found in zip archive".into()));
+            }
+        }
     };
     
     // DPS, DPV, groups, dpg

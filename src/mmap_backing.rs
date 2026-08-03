@@ -60,11 +60,17 @@ impl MmapBacking {
     /// Panics if the bytes are not aligned or the length is not a multiple
     /// of `size_of::<T>()`.
     pub fn cast_slice<T: Pod>(&self) -> &[T] {
+        if self.is_empty() {
+            return &[];
+        }
         cast_slice(self.as_bytes())
     }
 
     /// Cast the raw bytes to a mutable typed slice.
     pub fn cast_slice_mut<T: Pod>(&mut self) -> Result<&mut [T]> {
+        if self.is_empty() {
+            return Ok(&mut []);
+        }
         let bytes = self.as_bytes_mut()?;
         Ok(cast_slice_mut(bytes))
     }

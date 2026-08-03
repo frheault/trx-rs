@@ -277,9 +277,7 @@ fn detect_positions_dtype_dir(dir: &Path) -> Result<DType> {
             return Ok(parsed.dtype);
         }
     }
-    Err(TrxError::Format(
-        "no positions file found in directory".into(),
-    ))
+    Ok(DType::Float16)
 }
 
 fn detect_positions_dtype_zip(path: &Path) -> Result<DType> {
@@ -294,7 +292,5 @@ fn detect_positions_dtype_zip(path: &Path) -> Result<DType> {
             return Ok(parsed.dtype);
         }
     }
-    Err(TrxError::Format(
-        "no positions file found in zip archive".into(),
-    ))
+    Ok(DType::Float16)
 }
