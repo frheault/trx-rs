@@ -71,7 +71,7 @@ impl DataArray {
     }
 
     pub fn typed_view<T: Pod>(&self) -> TypedView2D<'_, T> {
-        let data: &[T] = cast_slice(self.as_bytes());
+        let data: &[T] = self.cast_slice();
         TypedView2D::new(data, self.ncols)
     }
 
@@ -188,12 +188,12 @@ impl<P: TrxScalar> TrxFile<P> {
 
     /// Positions as a flat slice of `[P; 3]` arrays.
     pub fn positions(&self) -> &[[P; 3]] {
-        cast_slice(self.positions_backing.as_bytes())
+        self.positions_backing.cast_slice()
     }
 
     /// Positions as a `TypedView2D` with 3 columns.
     pub fn positions_2d(&self) -> TypedView2D<'_, P> {
-        let flat: &[P] = cast_slice(self.positions_backing.as_bytes());
+        let flat: &[P] = self.positions_backing.cast_slice();
         TypedView2D::new(flat, 3)
     }
 
@@ -212,6 +212,9 @@ impl<P: TrxScalar> TrxFile<P> {
     /// Offsets as a slice of `u32`. Length is `nb_streamlines + 1`.
     /// The i-th streamline spans `positions[offsets[i]..offsets[i+1]]`.
     pub fn offsets(&self) -> &[u32] {
+        if self.header.nb_streamlines == 0 {
+            return &[0];
+        }
         self.offsets_backing.cast_slice()
     }
 
